@@ -261,8 +261,8 @@
   <section>
     <h2>Upload Dataset</h2>
     <p style="margin-bottom:18px;">
-      Upload a CSV file with the required columns below. The model will encode your data,
-      report missing values before and after encoding, and return predicted probabilities.
+      Upload a CSV or Excel (.xlsx) file with the required columns below. The model will
+      report missing values and return predicted probabilities.
     </p>
 
     <div class="card">
@@ -270,8 +270,8 @@
         <div class="drop-zone" id="drop-zone">
           <span class="drop-icon">📂</span>
           <strong>Click to browse</strong> or drag &amp; drop your CSV
-          <div class="hint">Accepts .csv files only</div>
-          <input type="file" id="file-input" name="file" accept=".csv" />
+          <div class="hint">Accepts .csv or .xlsx files</div>
+          <input type="file" id="file-input" name="file" accept=".csv,.xlsx,.xls" />
         </div>
         <div id="file-name"></div>
         <button type="submit" id="submit-btn">
@@ -325,11 +325,8 @@
           <thead>
             <tr>
               <th>Column</th>
-              <th>Missing before encoding (n)</th>
-              <th>Missing before encoding (%)</th>
-              <th>Missing after encoding (n)</th>
-              <th>Missing after encoding (%)</th>
-              <th>New missing introduced</th>
+              <th>Missing values (n)</th>
+              <th>Missing values (%)</th>
             </tr>
           </thead>
           <tbody id="summary-body"></tbody>
@@ -345,9 +342,9 @@
 </main>
 
 <script>
-  const form     = document.getElementById("upload-form");
-  const fileInput= document.getElementById("file-input");
-  const dropZone = document.getElementById("drop-zone");
+  const form       = document.getElementById("upload-form");
+  const fileInput  = document.getElementById("file-input");
+  const dropZone   = document.getElementById("drop-zone");
   const fileNameEl = document.getElementById("file-name");
   const submitBtn  = document.getElementById("submit-btn");
   const spinner    = document.getElementById("spinner");
@@ -358,7 +355,7 @@
 
   // Drag-and-drop visual
   dropZone.addEventListener("dragover", e => { e.preventDefault(); dropZone.classList.add("drag-over"); });
-  dropZone.addEventListener("dragleave", ()=> dropZone.classList.remove("drag-over"));
+  dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over"));
   dropZone.addEventListener("drop", e => {
     e.preventDefault();
     dropZone.classList.remove("drag-over");
@@ -371,18 +368,50 @@
     fileNameEl.textContent = fileInput.files[0]?.name ?? "";
   });
 
-  function showMsg(text, type) {
-    msgEl.textContent = text;
-    msgEl.className = "msg " + type;
+  function clearMsg() { msgEl.className = "msg"; msgEl.innerHTML = ""; }
+
+  function showSimpleError(text) {
+    msgEl.innerHTML = `<strong>Upload failed.</strong> ${text}`;
+    msgEl.className = "msg error";
   }
-  function clearMsg() { msgEl.className = "msg"; msgEl.textContent = ""; }
+
+  function showEncodingErrors(data) {
+    if (data.download_errors) {
+      // >10 errors — offer CSV download
+      msgEl.innerHTML =
+        `<strong>${data.total_errors} encoding errors found.</strong> Your file has too many errors to display inline. ` +
+        `<a href="/download-errors" style="color:inherit;font-weight:600;text-decoration:underline;">Download the full error report (CSV)</a> ` +
+        `to see every issue, fix them, and re-upload.`;
+    } else {
+      // ≤10 errors — show inline table
+      const rows = data.errors.map(e =>
+        `<tr>
+          <td class="mono" style="white-space:nowrap;">Row ${e.row}</td>
+          <td>${e.column}</td>
+          <td class="mono">${e.value}</td>
+          <td style="color:var(--ok);">${e.expected}</td>
+        </tr>`
+      ).join("");
+
+      msgEl.innerHTML =
+        `<strong>${data.total_errors} encoding error${data.total_errors > 1 ? "s" : ""} found.</strong> ` +
+        `Please fix the following and re-upload:<br><br>` +
+        `<div class="table-wrap"><table style="width:100%;margin-top:4px;">` +
+        `<thead><tr><th style="text-align:left;padding:6px 10px;font-size:0.75rem;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-dim);border-bottom:1px solid var(--border);">Row</th>` +
+        `<th style="text-align:left;padding:6px 10px;font-size:0.75rem;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-dim);border-bottom:1px solid var(--border);">Column</th>` +
+        `<th style="text-align:left;padding:6px 10px;font-size:0.75rem;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-dim);border-bottom:1px solid var(--border);">Invalid value</th>` +
+        `<th style="text-align:left;padding:6px 10px;font-size:0.75rem;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-dim);border-bottom:1px solid var(--border);">Expected</th></tr></thead>` +
+        `<tbody>${rows}</tbody></table></div>`;
+    }
+    msgEl.className = "msg error";
+  }
 
   form.addEventListener("submit", async e => {
     e.preventDefault();
     clearMsg();
     resultsEl.style.display = "none";
 
-    if (!fileInput.files.length) { showMsg("Please select a CSV file first.", "error"); return; }
+    if (!fileInput.files.length) { showSimpleError("Please select a file first."); return; }
 
     const fd = new FormData();
     fd.append("file", fileInput.files[0]);
@@ -394,40 +423,34 @@
       const res  = await fetch("/predict", { method: "POST", body: fd });
       const data = await res.json();
 
-      if (!res.ok || data.error) {
-        showMsg(data.error || "An unexpected error occurred.", "error");
+      if (!res.ok) {
+        if (data.error_type === "encoding") {
+          showEncodingErrors(data);
+        } else {
+          showSimpleError(data.error || "An unexpected error occurred.");
+        }
         return;
       }
 
-      // Meta chips
-      const newlyMissing = data.summary.reduce((acc, r) => acc + Math.max(0, r.after_n - r.before_n), 0);
+      // Meta chip
       metaEl.innerHTML = `
         <div class="meta-chip"><div class="label">Rows processed</div><div class="value">${data.total_rows}</div></div>
-        <div class="meta-chip"><div class="label">New missing after encoding</div><div class="value">${newlyMissing}</div></div>
       `;
 
-      // Table
-      bodyEl.innerHTML = data.summary.map(r => {
-        const introduced = Math.max(0, r.after_n - r.before_n);
-        const badge = introduced > 0
-          ? `<span class="badge badge-warn">+${introduced} new</span>`
-          : `<span class="badge badge-ok">None</span>`;
-        return `<tr>
-          <td>${r.column}</td>
-          <td class="mono">${r.before_n}</td>
-          <td class="mono">${r.before_pct.toFixed(1)}%</td>
-          <td class="mono">${r.after_n}</td>
-          <td class="mono">${r.after_pct.toFixed(1)}%</td>
-          <td>${badge}</td>
-        </tr>`;
-      }).join("");
+      // Summary table
+      bodyEl.innerHTML = data.summary.map(r => `<tr>
+        <td>${r.column}</td>
+        <td class="mono">${r.missing_n}</td>
+        <td class="mono">${r.missing_pct.toFixed(1)}%</td>
+      </tr>`).join("");
 
-      showMsg(`✓ Predictions generated for ${data.total_rows} row(s). Download your results below.`, "success");
+      msgEl.innerHTML = `✓ Predictions generated for ${data.total_rows} row(s). Download your results below.`;
+      msgEl.className = "msg success";
       resultsEl.style.display = "block";
       resultsEl.scrollIntoView({ behavior: "smooth" });
 
     } catch (err) {
-      showMsg("Network error — please try again.", "error");
+      showSimpleError("Network error — please try again.");
     } finally {
       submitBtn.disabled = false;
       spinner.style.display = "none";

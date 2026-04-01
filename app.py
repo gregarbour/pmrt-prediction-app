@@ -167,8 +167,8 @@ def calc_prob(row):
 
 def check_encoding_errors(df_raw):
     """
-    Returns a list of human-readable error strings describing rows/columns
-    where values are present but clearly incorrectly encoded.
+    Returns a list of dicts, one per bad cell:
+      { "row": int, "column": str (display name), "value": str, "expected": str }
     """
     errors = []
 
@@ -181,45 +181,37 @@ def check_encoding_errors(df_raw):
         "PRE_lymphovascular_invasion":    {"Y", "N"},
     }
     categorical_cols = {
-        "PRE_her_status": {"positive", "negative"},
-        "PRE_er_status":  {"positive", "negative"},
+        "PRE_her_status":    {"positive", "negative"},
+        "PRE_er_status":     {"positive", "negative"},
         "PRE_pre_op_biopsy": {"core needle biopsy", "surgical biopsy", "fine needle aspirate"},
     }
     numeric_cols = ["PRE_tumor_max_size_composite", "PRE_susp_LN_size_composite", "PRE_age_at_dx"]
 
-    # Reverse map internal → display name
     display_name = {v: k for k, v in REQUIRED_COLUMNS.items()}
 
     for col, valid_set in yn_cols.items():
-        bad_rows = []
-        for i, val in enumerate(df_raw[col], start=2):  # row 2 = first data row
+        for i, val in enumerate(df_raw[col], start=2):
             s = str(val).strip()
             if s in ("", "nan", "NaN"):
                 continue
             if s not in valid_set:
-                bad_rows.append(f'row {i} ("{val}")')
-        if bad_rows:
-            errors.append(
-                f'Column "{display_name[col]}": invalid value(s) at {", ".join(bad_rows)}. '
-                f"Expected {VALID_VALUES[col]}."
-            )
+                errors.append({
+                    "row": i, "column": display_name[col],
+                    "value": str(val), "expected": VALID_VALUES[col],
+                })
 
     for col, valid_set in categorical_cols.items():
-        bad_rows = []
         for i, val in enumerate(df_raw[col], start=2):
             s = str(val).strip().lower()
             if s in ("", "nan", "NaN"):
                 continue
             if s not in valid_set:
-                bad_rows.append(f'row {i} ("{val}")')
-        if bad_rows:
-            errors.append(
-                f'Column "{display_name[col]}": invalid value(s) at {", ".join(bad_rows)}. '
-                f"Expected {VALID_VALUES[col]}."
-            )
+                errors.append({
+                    "row": i, "column": display_name[col],
+                    "value": str(val), "expected": VALID_VALUES[col],
+                })
 
     for col in numeric_cols:
-        bad_rows = []
         for i, val in enumerate(df_raw[col], start=2):
             s = str(val).strip()
             if s in ("", "nan", "NaN"):
@@ -227,12 +219,10 @@ def check_encoding_errors(df_raw):
             try:
                 float(s)
             except ValueError:
-                bad_rows.append(f'row {i} ("{val}")')
-        if bad_rows:
-            errors.append(
-                f'Column "{display_name[col]}": non-numeric value(s) at {", ".join(bad_rows)}. '
-                f"Expected {VALID_VALUES[col]}."
-            )
+                errors.append({
+                    "row": i, "column": display_name[col],
+                    "value": str(val), "expected": VALID_VALUES[col],
+                })
 
     return errors
 
@@ -255,11 +245,17 @@ def predict():
     if f.filename == "":
         return jsonify({"error": "No file selected."}), 400
 
-    # Read CSV
+    # Read CSV or XLSX
+    filename = f.filename.lower()
     try:
-        df = pd.read_csv(f)
+        if filename.endswith(".xlsx") or filename.endswith(".xls"):
+            df = pd.read_excel(f, engine="openpyxl")
+        elif filename.endswith(".csv"):
+            df = pd.read_csv(f)
+        else:
+            return jsonify({"error": "Unsupported file type. Please upload a .csv or .xlsx file."}), 400
     except Exception as e:
-        return jsonify({"error": f"Could not read CSV: {e}"}), 400
+        return jsonify({"error": f"Could not read file: {e}"}), 400
 
     # --- Column validation ---
     missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
@@ -277,13 +273,29 @@ def predict():
     # --- Encoding validation (before encoding) ---
     encoding_errors = check_encoding_errors(df)
     if encoding_errors:
-        return jsonify({
-            "error": (
-                "Your CSV contains incorrectly encoded values. "
-                "Please fix the following and re-upload:\n\n"
-                + "\n".join(f"  • {e}" for e in encoding_errors)
-            )
-        }), 400
+        total_errors = len(encoding_errors)
+        if total_errors > 10:
+            # Build a downloadable error CSV
+            err_df = pd.DataFrame(encoding_errors)[["row", "column", "value", "expected"]]
+            err_df.columns = ["Row", "Column", "Invalid Value", "Expected Values"]
+            err_csv = io.BytesIO()
+            err_df.to_csv(err_csv, index=False)
+            err_csv.seek(0)
+            app.config["_last_error_csv"] = err_csv.getvalue()
+            return jsonify({
+                "error_type": "encoding",
+                "total_errors": total_errors,
+                "download_errors": True,
+                "errors": [],
+            }), 400
+        else:
+            app.config["_last_error_csv"] = None
+            return jsonify({
+                "error_type": "encoding",
+                "total_errors": total_errors,
+                "download_errors": False,
+                "errors": encoding_errors,
+            }), 400
 
     # --- Count missing before encoding ---
     missing_before = df[ENCODED_COLS].isna().sum()
@@ -297,12 +309,6 @@ def predict():
     # --- Encode ---
     df[ENCODED_COLS] = df[ENCODED_COLS].apply(encode_row, axis=1)
 
-    # --- Count missing after encoding ---
-    missing_after = df[ENCODED_COLS].isna().sum()
-    pct_after     = df[ENCODED_COLS].isna().mean() * 100
-    after_df = pd.DataFrame({"Missing (n)": missing_after, "Missing (%)": pct_after.round(1)})
-    after_df.index = before_df.index
-
     # --- Impute ---
     df.fillna(IMPUTE_VALUES, inplace=True)
 
@@ -315,17 +321,12 @@ def predict():
     output.seek(0)
 
     # --- Build summary payload ---
-    def df_to_records(d):
-        return [
-            {"column": idx, "before_n": int(row["Missing (n)"]), "before_pct": float(row["Missing (%)"]),
-             "after_n": int(after_df.loc[idx, "Missing (n)"]), "after_pct": float(after_df.loc[idx, "Missing (%)"])}
-            for idx, row in d.iterrows()
-        ]
-
-    summary = df_to_records(before_df)
+    summary = [
+        {"column": idx, "missing_n": int(row["Missing (n)"]), "missing_pct": float(row["Missing (%)"])}
+        for idx, row in before_df.iterrows()
+    ]
     total_rows = len(df)
 
-    # Store output CSV in session via a simple in-memory cache (fine for single-dyno free tier)
     app.config["_last_output"] = output.getvalue()
 
     return jsonify({
@@ -345,6 +346,19 @@ def download():
         mimetype="text/csv",
         as_attachment=True,
         download_name="predictions.csv",
+    )
+
+
+@app.route("/download-errors")
+def download_errors():
+    data = app.config.get("_last_error_csv")
+    if not data:
+        return "No error report available.", 404
+    return send_file(
+        io.BytesIO(data),
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name="encoding_errors.csv",
     )
 
 
